@@ -30,13 +30,16 @@ import org.jetbrains.annotations.Nullable;
 
 /**
  * Fast obstructing-block breaking AI goal for both horde members and regular Zombies.
- * Breaks only blocks directly obstructing the path/line-of-sight between the mob and its target.
+ * Breaks only blocks directly obstructing the path/line-of-sight within realistic melee reach:
+ * max 2.2 blocks distance, vertically bounded to [mobY - 1, mobY + 2] (at most 1 block above head).
  */
 public final class BreakBlockGoal implements Goal<Mob> {
 
     public static final int PRIORITY = 1;
     public static final double VISION_RADIUS = 24.0;
-    public static final double BREAK_REACH = 2.8;
+    public static final double BREAK_REACH = 2.2;
+    public static final double MAX_HORIZ_REACH_SQ = 2.3 * 2.3;
+    public static final int MAX_ABOVE_FEET_Y = 2; // feet=Y, head=Y+1, ceiling directly above head=Y+2
     public static final int TICK_INTERVAL = 5; // 5 ticks (0.25s) per stage -> ~2.5s for 10 stages (1 zombie)
     public static final int TARGET_SCAN_INTERVAL_TICKS = 20;
     public static final int MAX_PLAYERS_RAYCAST_PER_SCAN = 8;
@@ -202,8 +205,9 @@ public final class BreakBlockGoal implements Goal<Mob> {
 
     /**
      * Finds the closest breakable block directly obstructing the mob from reaching its target
-     * via eye-to-eye and body-to-body raycasts within BREAK_REACH. Never digs floor blocks
-     * unless the target is actually below the mob, and skips jumpable 1-block terrain steps.
+     * via eye-to-eye and body-to-body raycasts within BREAK_REACH (2.2 blocks).
+     * Strictly limits vertical reach to [mobY - 1, mobY + 2] (never 3-5 blocks above head),
+     * never digs floor blocks unless target is below the mob, and skips jumpable 1-block terrain steps.
      */
     @Nullable
     private Block findObstructingBlock(@NotNull LivingEntity target) {
@@ -212,24 +216,26 @@ public final class BreakBlockGoal implements Goal<Mob> {
             return null;
         }
 
-        int mobBlockY = mob.getLocation().getBlockY();
+        Location mobLoc = mob.getLocation();
+        int mobBlockY = mobLoc.getBlockY();
         int targetBlockY = target.getLocation().getBlockY();
 
-        // 1. Eye-to-eye raycast (detects walls, windows, ceilings, pillars blocking sight)
-        Block eyeHit = raycastObstructingBlock(world, mob.getEyeLocation(), target.getEyeLocation(), mobBlockY, targetBlockY);
+        // 1. Eye-to-eye raycast (detects walls, windows, ceiling directly above head)
+        Block eyeHit = raycastObstructingBlock(world, mobLoc, mob.getEyeLocation(), target.getEyeLocation(), mobBlockY, targetBlockY);
         if (eyeHit != null) {
             return eyeHit;
         }
 
         // 2. Body-to-body raycast (detects fences, lower walls, doors blocking movement)
-        Location mobBody = mob.getLocation().add(0.0, 0.5, 0.0);
+        Location mobBody = mobLoc.clone().add(0.0, 0.5, 0.0);
         Location targetBody = target.getLocation().add(0.0, 0.5, 0.0);
-        return raycastObstructingBlock(world, mobBody, targetBody, mobBlockY, targetBlockY);
+        return raycastObstructingBlock(world, mobLoc, mobBody, targetBody, mobBlockY, targetBlockY);
     }
 
     @Nullable
     private Block raycastObstructingBlock(
             @NotNull World world,
+            @NotNull Location mobLoc,
             @NotNull Location from,
             @NotNull Location to,
             int mobBlockY,
@@ -254,8 +260,23 @@ public final class BreakBlockGoal implements Goal<Mob> {
 
         int hitY = block.getY();
 
-        // Never break floor/ground blocks under the mob unless the target is genuinely below the mob
+        // Vertical ceiling clamp: never break blocks more than 1 block above the zombie's head (mobY + 2)
+        if (hitY > mobBlockY + MAX_ABOVE_FEET_Y) {
+            return null;
+        }
+
+        // Never break blocks more than 1 block below feet, and never dig floor unless target is below the mob
+        if (hitY < mobBlockY - 1) {
+            return null;
+        }
         if (hitY < mobBlockY && targetBlockY >= mobBlockY - 1) {
+            return null;
+        }
+
+        // Horizontal distance guard (<= 2.3 blocks from mob center to block center)
+        double hdx = (block.getX() + 0.5) - mobLoc.getX();
+        double hdz = (block.getZ() + 0.5) - mobLoc.getZ();
+        if (hdx * hdx + hdz * hdz > MAX_HORIZ_REACH_SQ) {
             return null;
         }
 
