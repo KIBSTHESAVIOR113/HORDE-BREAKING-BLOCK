@@ -6,18 +6,15 @@ import org.bukkit.Material;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Explicit registry of blocks breakable by horde members (FR-09).
- * Isolated here so any adjustment to [I] inferred block lists requires editing only this file.
+ * Registry of blocks breakable by horde members and zombies.
  */
 public final class BreakableBlocks {
 
-    // Plain glass + plain glass pane only (stained and tinted glass excluded per PRD FR-09)
     public static final Set<Material> GLASS_BLOCKS = EnumSet.of(
             Material.GLASS,
             Material.GLASS_PANE
     );
 
-    // [I] 14 wooden fences and fence gates (oak through mangrove; excludes nether_brick, bamboo, cherry, crimson, warped)
     public static final Set<Material> FENCE_BLOCKS = EnumSet.of(
             Material.OAK_FENCE,
             Material.SPRUCE_FENCE,
@@ -35,6 +32,25 @@ public final class BreakableBlocks {
             Material.MANGROVE_FENCE_GATE
     );
 
+    private static final Set<Material> NON_BREAKABLE = EnumSet.of(
+            Material.WATER,
+            Material.LAVA,
+            Material.BUBBLE_COLUMN,
+            Material.FIRE,
+            Material.SOUL_FIRE,
+            Material.LIGHT,
+            Material.BEDROCK,
+            Material.BARRIER,
+            Material.END_PORTAL,
+            Material.END_PORTAL_FRAME,
+            Material.NETHER_PORTAL,
+            Material.COMMAND_BLOCK,
+            Material.CHAIN_COMMAND_BLOCK,
+            Material.REPEATING_COMMAND_BLOCK,
+            Material.STRUCTURE_BLOCK,
+            Material.JIGSAW
+    );
+
     private BreakableBlocks() {
     }
 
@@ -46,5 +62,18 @@ public final class BreakableBlocks {
             return true;
         }
         return breakFence && FENCE_BLOCKS.contains(material);
+    }
+
+    /**
+     * Returns true for any normal survival-breakable block (excludes air, liquids, and unbreakable blocks).
+     */
+    public static boolean isAnyBreakableBlock(@Nullable Material material) {
+        if (material == null || !material.isBlock() || material.isAir()) {
+            return false;
+        }
+        if (NON_BREAKABLE.contains(material)) {
+            return false;
+        }
+        return material.getHardness() >= 0.0f;
     }
 }
