@@ -11,7 +11,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.List;
-import java.util.UUID;
 import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
@@ -23,25 +22,24 @@ import org.bukkit.entity.Entity;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Mob;
 import org.bukkit.entity.Player;
+import org.bukkit.entity.Zombie;
 import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Glass and wooden fence breaking AI goal (FR-09, priority 1, no control flags).
- * Uses BreakProgressTracker for O(1) shared progress & stale expiry (N-01, Q6),
- * TickThrottle + bounded nearest-first raycast (N-01, NFR-04),
- * PaperApiAdapter crack semantics (N-08), and WorldGuard denied-block cooldown (D3-07).
+ * Fast all-block breaking AI goal for both horde members and regular Zombies.
+ * Breaks any survival-breakable block in ~2.5s (1 zombie) or faster with multiple zombies.
  */
 public final class BreakBlockGoal implements Goal<Mob> {
 
     public static final int PRIORITY = 1;
     public static final double VISION_RADIUS = 24.0;
-    public static final int TICK_INTERVAL = 20;
+    public static final int TICK_INTERVAL = 5; // 5 ticks (0.25s) per stage -> ~2.5s for 10 stages (1 zombie)
     public static final int TARGET_SCAN_INTERVAL_TICKS = 20;
     public static final int MAX_PLAYERS_RAYCAST_PER_SCAN = 8;
-    public static final int PROTECTED_BLOCK_COOLDOWN_TICKS = 200; // 10s backoff if WorldGuard cancels break (D3-07)
+    public static final int PROTECTED_BLOCK_COOLDOWN_TICKS = 200;
     private static final double CRACK_NOTIFY_RADIUS_SQ = 48.0 * 48.0;
 
     private static final BreakProgressTracker<BlockKey> TRACKER =
@@ -62,8 +60,7 @@ public final class BreakBlockGoal implements Goal<Mob> {
         this.patrolData = patrolData;
         this.mob = mob;
         this.key = getKey(plugin);
-        // D3-08: Lightweight per-mob phase jitter (0..9) to spread 60-mob CPU work across ticks
-        this.tickCounter = Math.floorMod(mob.getUniqueId().hashCode(), 10);
+        this.tickCounter = Math.floorMod(mob.getUniqueId().hashCode(), TICK_INTERVAL);
     }
 
     @NotNull
@@ -71,19 +68,12 @@ public final class BreakBlockGoal implements Goal<Mob> {
         return GoalKey.of(Mob.class, new NamespacedKey(plugin, "break_block"));
     }
 
-    /**
-     * Q6 / N-09: Expires stale block-break entries (~5 seconds without update) and clears their crack overlays.
-     * Called every 20 ticks from HordeManager's independent maintenance task.
-     */
     public static void expireStale() {
         for (BlockKey expired : TRACKER.expire()) {
             resetCrackOverlay(expired);
         }
     }
 
-    /**
-     * Cleans up active block tracking when a mob dies or is removed from the world (Q6).
-     */
     public static void onMobRemoved(@NotNull Mob mob) {
         BlockKey released = TRACKER.release(mob.getUniqueId());
         if (released != null) {
@@ -91,33 +81,32 @@ public final class BreakBlockGoal implements Goal<Mob> {
         }
     }
 
-    /**
-     * NFR-07: Clears all active crack animations and progress on plugin disable.
-     */
     public static void clearAllProgress() {
         for (BlockKey key : TRACKER.clear()) {
             resetCrackOverlay(key);
         }
     }
 
+    private boolean isEligibleBreaker() {
+        return patrolData.isPatrolling(mob) || mob instanceof Zombie;
+    }
+
     @Override
     public boolean shouldActivate() {
-        if (!mob.isValid() || mob.isDead() || !patrolData.isPatrolling(mob)) {
+        if (!mob.isValid() || mob.isDead() || !isEligibleBreaker()) {
             return false;
         }
         MainConfig cfg = plugin.getMainConfig();
         if (!cfg.isHordeMemberBreakGlass() && !cfg.isHordeMemberBreakFence()) {
             return false;
         }
-        // Cheap path: already has a valid combat target, no raycast needed (N-01)
         if (isValidCombatTarget(mob.getTarget())) {
             return true;
         }
-        // N-01: Throttle glass/fence vision scan in shouldActivate() to at most once per 20 ticks
         if (!scanThrottle.tryAcquire(mob.getTicksLived(), TARGET_SCAN_INTERVAL_TICKS)) {
             return false;
         }
-        Player seen = findTargetThroughBreakable(cfg.isHordeMemberBreakGlass(), cfg.isHordeMemberBreakFence());
+        Player seen = findTargetThroughBreakable();
         if (seen == null) {
             return false;
         }
@@ -127,7 +116,7 @@ public final class BreakBlockGoal implements Goal<Mob> {
 
     @Override
     public boolean shouldStayActive() {
-        if (!mob.isValid() || mob.isDead() || !patrolData.isPatrolling(mob)) {
+        if (!mob.isValid() || mob.isDead() || !isEligibleBreaker()) {
             return false;
         }
         MainConfig cfg = plugin.getMainConfig();
@@ -139,7 +128,7 @@ public final class BreakBlockGoal implements Goal<Mob> {
 
     @Override
     public void start() {
-        tickCounter = Math.floorMod(mob.getUniqueId().hashCode(), 10);
+        tickCounter = Math.floorMod(mob.getUniqueId().hashCode(), TICK_INTERVAL);
     }
 
     @Override
@@ -163,14 +152,11 @@ public final class BreakBlockGoal implements Goal<Mob> {
         tickCounter = 0;
 
         MainConfig cfg = plugin.getMainConfig();
-        boolean breakGlass = cfg.isHordeMemberBreakGlass();
-        boolean breakFence = cfg.isHordeMemberBreakFence();
-        if (!breakGlass && !breakFence) {
+        if (!cfg.isHordeMemberBreakGlass() && !cfg.isHordeMemberBreakFence()) {
             return;
         }
 
-        // C4-05: shouldStayActive() already guarantees a valid combat target here (removed dead branch)
-        Block foundBlock = findAdjacentBreakableBlock(breakGlass, breakFence);
+        Block foundBlock = findAdjacentBreakableBlock();
         if (foundBlock == null) {
             BlockKey released = TRACKER.release(mob.getUniqueId());
             if (released != null) {
@@ -180,7 +166,6 @@ public final class BreakBlockGoal implements Goal<Mob> {
         }
 
         BlockKey foundKey = BlockKey.of(foundBlock);
-        // D3-07 + C4-05: Release any previously held block before backing off on a WorldGuard-denied block
         if (foundKey.equals(lastDeniedBlockKey) && mob.getTicksLived() < deniedCooldownUntilTick) {
             BlockKey released = TRACKER.release(mob.getUniqueId());
             if (released != null) {
@@ -196,7 +181,6 @@ public final class BreakBlockGoal implements Goal<Mob> {
 
         if (result.completed()) {
             resetCrackOverlay(foundKey);
-            // Respect WorldGuard / protection plugins via EntityChangeBlockEvent (FR-09, N-10)
             if (PaperApiAdapter.canEntityBreakBlock(mob, foundBlock)) {
                 foundBlock.breakNaturally();
                 lastDeniedBlockKey = null;
@@ -210,11 +194,8 @@ public final class BreakBlockGoal implements Goal<Mob> {
         }
     }
 
-    /**
-     * Scans y from +2 down to -2, distance 1..2 along mob's horizontal facing (FR-09).
-     */
     @Nullable
-    private Block findAdjacentBreakableBlock(boolean breakGlass, boolean breakFence) {
+    private Block findAdjacentBreakableBlock() {
         World world = mob.getWorld();
         Location loc = mob.getLocation();
         int baseX = loc.getBlockX();
@@ -224,7 +205,9 @@ public final class BreakBlockGoal implements Goal<Mob> {
         int modX = facing.getModX();
         int modZ = facing.getModZ();
 
-        for (int dy = 2; dy >= -2; dy--) {
+        // Scan head/body height first (y+1, y, y+2, y-1) so mobs tunnel cleanly toward players
+        int[] yOrder = {1, 0, 2, -1};
+        for (int dy : yOrder) {
             int y = baseY + dy;
             if (y < world.getMinHeight() || y >= world.getMaxHeight()) {
                 continue;
@@ -236,7 +219,7 @@ public final class BreakBlockGoal implements Goal<Mob> {
                     continue;
                 }
                 Block block = world.getBlockAt(bx, y, bz);
-                if (BreakableBlocks.isBreakable(block.getType(), breakGlass, breakFence)) {
+                if (BreakableBlocks.isAnyBreakableBlock(block.getType())) {
                     return block;
                 }
             }
@@ -244,12 +227,8 @@ public final class BreakBlockGoal implements Goal<Mob> {
         return null;
     }
 
-    /**
-     * FR-09 + N-01: Players within 24-block expanded box sorted nearest-first, raycasting at most
-     * MAX_PLAYERS_RAYCAST_PER_SCAN players from eye-to-eye to bound worst-case CPU cost.
-     */
     @Nullable
-    private Player findTargetThroughBreakable(boolean breakGlass, boolean breakFence) {
+    private Player findTargetThroughBreakable() {
         World world = mob.getWorld();
         Location mobEyes = mob.getEyeLocation();
         List<Player> candidates = new ArrayList<>();
@@ -277,7 +256,7 @@ public final class BreakBlockGoal implements Goal<Mob> {
             Vector direction = delta.multiply(1.0 / dist);
             RayTraceResult hit = PaperApiAdapter.rayTraceBlocks(world, mobEyes, direction, dist);
             if (hit != null && hit.getHitBlock() != null
-                    && BreakableBlocks.isBreakable(hit.getHitBlock().getType(), breakGlass, breakFence)) {
+                    && BreakableBlocks.isAnyBreakableBlock(hit.getHitBlock().getType())) {
                 return player;
             }
         }
@@ -302,7 +281,6 @@ public final class BreakBlockGoal implements Goal<Mob> {
         }
         float progress = PaperApiAdapter.crackStageToProgress(stage);
         for (Player player : world.getPlayers()) {
-            // E-03: Consistent with D-06, use isOnline() rather than isValid()
             if (player.isOnline() && player.getLocation().distanceSquared(blockLoc) <= CRACK_NOTIFY_RADIUS_SQ) {
                 PaperApiAdapter.sendBlockDamage(player, blockLoc, progress, sourceId);
             }
@@ -333,7 +311,7 @@ public final class BreakBlockGoal implements Goal<Mob> {
         return EnumSet.noneOf(GoalType.class);
     }
 
-    public record BlockKey(@NotNull UUID worldId, int x, int y, int z) {
+    public record BlockKey(@NotNull java.util.UUID worldId, int x, int y, int z) {
         @NotNull
         public static BlockKey of(@NotNull Block block) {
             return new BlockKey(block.getWorld().getUID(), block.getX(), block.getY(), block.getZ());
