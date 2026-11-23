@@ -1,0 +1,16 @@
+name: MebahelZombieHorde
+version: '${version}'
+main: io.github.mebahel.zombiehorde.ZombieHordePlugin
+api-version: '26.3'
+authors: [MebahelZombieHordePort]
+description: Clean-room Paper 26.3 port of Mebahel's Zombie Horde behavioral specification.
+website: ''
+commands:
+  mebahelzombiehorde:
+    description: Manage MebahelZombieHorde spawning and configuration.
+    usage: /<command> <spawnhorde|reloadconfig|nextspawn>
+    permission: mebahelzombiehorde.admin
+permissions:
+  mebahelzombiehorde.admin:
+    description: Allows administration of MebahelZombieHorde commands.
+    default: op
