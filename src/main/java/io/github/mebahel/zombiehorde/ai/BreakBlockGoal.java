@@ -11,13 +11,13 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.UUID;
 import org.bukkit.Bukkit;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.block.Block;
-import org.bukkit.block.BlockFace;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Mob;
@@ -29,13 +29,14 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 /**
- * Fast all-block breaking AI goal for both horde members and regular Zombies.
- * Breaks any survival-breakable block in ~2.5s (1 zombie) or faster with multiple zombies.
+ * Fast obstructing-block breaking AI goal for both horde members and regular Zombies.
+ * Breaks only blocks directly obstructing the path/line-of-sight between the mob and its target.
  */
 public final class BreakBlockGoal implements Goal<Mob> {
 
     public static final int PRIORITY = 1;
     public static final double VISION_RADIUS = 24.0;
+    public static final double BREAK_REACH = 2.8;
     public static final int TICK_INTERVAL = 5; // 5 ticks (0.25s) per stage -> ~2.5s for 10 stages (1 zombie)
     public static final int TARGET_SCAN_INTERVAL_TICKS = 20;
     public static final int MAX_PLAYERS_RAYCAST_PER_SCAN = 8;
@@ -156,7 +157,12 @@ public final class BreakBlockGoal implements Goal<Mob> {
             return;
         }
 
-        Block foundBlock = findAdjacentBreakableBlock();
+        LivingEntity target = mob.getTarget();
+        if (!isValidCombatTarget(target)) {
+            return;
+        }
+
+        Block foundBlock = findObstructingBlock(target);
         if (foundBlock == null) {
             BlockKey released = TRACKER.release(mob.getUniqueId());
             if (released != null) {
@@ -194,37 +200,74 @@ public final class BreakBlockGoal implements Goal<Mob> {
         }
     }
 
+    /**
+     * Finds the closest breakable block directly obstructing the mob from reaching its target
+     * via eye-to-eye and body-to-body raycasts within BREAK_REACH. Never digs floor blocks
+     * unless the target is actually below the mob, and skips jumpable 1-block terrain steps.
+     */
     @Nullable
-    private Block findAdjacentBreakableBlock() {
+    private Block findObstructingBlock(@NotNull LivingEntity target) {
         World world = mob.getWorld();
-        Location loc = mob.getLocation();
-        int baseX = loc.getBlockX();
-        int baseY = loc.getBlockY();
-        int baseZ = loc.getBlockZ();
-        BlockFace facing = PaperApiAdapter.getHorizontalFacing(mob);
-        int modX = facing.getModX();
-        int modZ = facing.getModZ();
+        if (!world.equals(target.getWorld())) {
+            return null;
+        }
 
-        // Scan head/body height first (y+1, y, y+2, y-1) so mobs tunnel cleanly toward players
-        int[] yOrder = {1, 0, 2, -1};
-        for (int dy : yOrder) {
-            int y = baseY + dy;
-            if (y < world.getMinHeight() || y >= world.getMaxHeight()) {
-                continue;
-            }
-            for (int dist = 1; dist <= 2; dist++) {
-                int bx = baseX + modX * dist;
-                int bz = baseZ + modZ * dist;
-                if (!world.isChunkLoaded(bx >> 4, bz >> 4)) {
-                    continue;
-                }
-                Block block = world.getBlockAt(bx, y, bz);
-                if (BreakableBlocks.isAnyBreakableBlock(block.getType())) {
-                    return block;
-                }
+        int mobBlockY = mob.getLocation().getBlockY();
+        int targetBlockY = target.getLocation().getBlockY();
+
+        // 1. Eye-to-eye raycast (detects walls, windows, ceilings, pillars blocking sight)
+        Block eyeHit = raycastObstructingBlock(world, mob.getEyeLocation(), target.getEyeLocation(), mobBlockY, targetBlockY);
+        if (eyeHit != null) {
+            return eyeHit;
+        }
+
+        // 2. Body-to-body raycast (detects fences, lower walls, doors blocking movement)
+        Location mobBody = mob.getLocation().add(0.0, 0.5, 0.0);
+        Location targetBody = target.getLocation().add(0.0, 0.5, 0.0);
+        return raycastObstructingBlock(world, mobBody, targetBody, mobBlockY, targetBlockY);
+    }
+
+    @Nullable
+    private Block raycastObstructingBlock(
+            @NotNull World world,
+            @NotNull Location from,
+            @NotNull Location to,
+            int mobBlockY,
+            int targetBlockY
+    ) {
+        Vector delta = to.toVector().subtract(from.toVector());
+        double dist = delta.length();
+        if (dist < 0.05) {
+            return null;
+        }
+        double maxDist = Math.min(dist, BREAK_REACH);
+        Vector dir = delta.multiply(1.0 / dist);
+        RayTraceResult hit = PaperApiAdapter.rayTraceBlocks(world, from, dir, maxDist);
+        if (hit == null || hit.getHitBlock() == null) {
+            return null;
+        }
+
+        Block block = hit.getHitBlock();
+        if (!BreakableBlocks.isAnyBreakableBlock(block.getType())) {
+            return null;
+        }
+
+        int hitY = block.getY();
+
+        // Never break floor/ground blocks under the mob unless the target is genuinely below the mob
+        if (hitY < mobBlockY && targetBlockY >= mobBlockY - 1) {
+            return null;
+        }
+
+        // Skip normal 1-block jumpable steps (like grass hills/stairs) when the space above is open
+        if (hitY == mobBlockY) {
+            Block above = world.getBlockAt(block.getX(), hitY + 1, block.getZ());
+            if (above.isPassable() && block.getBoundingBox().getHeight() <= 1.0) {
+                return null;
             }
         }
-        return null;
+
+        return block;
     }
 
     @Nullable
@@ -311,7 +354,7 @@ public final class BreakBlockGoal implements Goal<Mob> {
         return EnumSet.noneOf(GoalType.class);
     }
 
-    public record BlockKey(@NotNull java.util.UUID worldId, int x, int y, int z) {
+    public record BlockKey(@NotNull UUID worldId, int x, int y, int z) {
         @NotNull
         public static BlockKey of(@NotNull Block block) {
             return new BlockKey(block.getWorld().getUID(), block.getX(), block.getY(), block.getZ());
